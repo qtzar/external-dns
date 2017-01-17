@@ -12,6 +12,7 @@ import (
 	"github.com/rancher/external-dns/providers"
 	_ "github.com/rancher/external-dns/providers/cloudflare"
 	_ "github.com/rancher/external-dns/providers/digitalocean"
+	_ "github.com/rancher/external-dns/providers/dnsme"
 	_ "github.com/rancher/external-dns/providers/dnsimple"
 	_ "github.com/rancher/external-dns/providers/gandi"
 	_ "github.com/rancher/external-dns/providers/pointhq"
