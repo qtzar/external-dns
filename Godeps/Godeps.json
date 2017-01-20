@@ -1,7 +1,7 @@
 {
 	"ImportPath": "github.com/rancher/external-dns",
-	"GoVersion": "go1.5.1",
-	"GodepVersion": "v75",
+	"GoVersion": "go1.7",
+	"GodepVersion": "v77",
 	"Packages": [
 		"./..."
 	],
@@ -247,6 +247,10 @@
 		{
 			"ImportPath": "golang.org/x/oauth2/internal",
 			"Rev": "314dd2c0bf3ebd592ec0d20847d27e79d0dbe8dd"
+		},
+		{
+			"ImportPath": "github.com/huguesalary/dnsmadeeasy",
+			"Rev": "37c0bc8bb1292e55f04352dc86f7e3080cdf4982"
 		}
 	]
 }
