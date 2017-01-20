@@ -1,34 +1,43 @@
 package dnsme
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha1"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
-  "strconv"
 
 	"github.com/Sirupsen/logrus"
-  api "github.com/soniah/dnsmadeeasy"
+	api "github.com/huguesalary/dnsmadeeasy"
 	"github.com/rancher/external-dns/providers"
 	"github.com/rancher/external-dns/utils"
 )
 
+// DNSMEProvider Structure
 type DNSMEProvider struct {
-  dnsmeDomainId string
-  dnsmeZone string
-	dnsmeServer  string
-	dnsmeKey string
-	dnsmeSecret  string
+	dnsmeDomainID uint32
+	dnsmeZone     string
+	dnsmeServer   string
+	dnsmeKey      string
+	dnsmeSecret   string
 }
 
 func init() {
 	providers.RegisterProvider("dnsme", &DNSMEProvider{})
 }
 
+// Init provider
 func (r *DNSMEProvider) Init(rootDomainName string) error {
-	var domainId, keyName, secret, server, raw_sandbox string
-  var sandBox bool
+	var domainID, keyName, secret, server, rawSandbox string
+	var sandBox bool
 
-  if domainId = os.Getenv("DNSME_DOMAINID"); len(domainId) == 0 {
+	if domainID = os.Getenv("DNSME_DOMAINID"); len(domainID) == 0 {
 		return fmt.Errorf("DNSME_DOMAINID is not set")
 	}
 
@@ -40,195 +49,224 @@ func (r *DNSMEProvider) Init(rootDomainName string) error {
 		return fmt.Errorf("DNSME_SECRET is not set")
 	}
 
-
-  raw_sandbox = os.Getenv("DNSME_SANDBOX")
-  sandbox, err := strconv.ParseBool(raw_sandbox)
-  if err != nil {
-    return fmt.Errorf("DNSME_SANDBOX is not set")
-  }
+	rawSandbox = os.Getenv("DNSME_SANDBOX")
+	sandBox, err := strconv.ParseBool(rawSandbox)
+	if err != nil {
+		return fmt.Errorf("DNSME_SANDBOX is not set")
+	}
 
 	if sandBox {
-		server = "https://api.sandbox.dnsmadeeasy.com/V2.0/"
+		server = "https://api.sandbox.dnsmadeeasy.com/V2.0/dns/managed/"
 	} else {
-    server = "https://api.dnsmadeeasy.com/V2.0/"
-  }
+		server = "https://api.dnsmadeeasy.com/V2.0/dns/managed/"
+	}
 
-//TODO Rate Limiting
-//  This limit is 150 requests per 5 minute scrolling window
+	//TODO Rate Limiting
+	//  This limit is 150 requests per 5 minute scrolling window
 
-  r.dnsmeZone = rootDomainName
-  r.dnsmeDomainId = domainId
+	// Convert the domainID in to a uint
+	u64domainID, err := strconv.ParseUint(domainID, 10, 32)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	r.dnsmeZone = rootDomainName
+	r.dnsmeDomainID = uint32(u64domainID)
 	r.dnsmeServer = server
 	r.dnsmeKey = keyName
 	r.dnsmeSecret = secret
 
 	logrus.Infof("Configured %s with domain id '%s' and nameserver '%s'",
-		r.GetName(), r.domainId, r.dnsmeServer)
+		r.GetName(), r.dnsmeDomainID, r.dnsmeServer)
 
 	return nil
 }
 
+// GetName of provider
 func (*DNSMEProvider) GetName() string {
 	return "DNS Made Easy"
 }
 
+// HealthCheck for provider
 func (r *DNSMEProvider) HealthCheck() error {
 	_, err := r.GetRecords()
 	return err
 }
 
+// AddRecord to provider
 func (r *DNSMEProvider) AddRecord(record utils.DnsRecord) error {
-  logrus.Debugf("Adding Record '%s %s'", record.Fqdn, record.Type)
+	logrus.Debugf("Adding Record '%s %s'", record.Fqdn, record.Type)
 
-  client, err := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
-  	if err != nil {
-  		logrus.Fatalf("err: %v", err)
-  	}
+	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
 
-    client.URL = r.dnsmeServer
+	client.Url = r.dnsmeServer
 
-    for _, rec := range record.Records {
-      logrus.Debugf("Adding RR: '%s %d %s %s'", record.Fqdn, record.TTL, record.Type, rec)
-      cr := map[string]interface{}{
-		    "name":  record.Fqdn,
-		    "type":  record.Type,
-		    "value": rec,
-		    "ttl":   record.TTL,
-	    }
+	for _, rec := range record.Records {
+		logrus.Debugf("Adding RR: '%s %d %s %s'", record.Fqdn, record.TTL, record.Type, rec)
 
-	    result, err2 := client.CreateRecord(r.dnsmeDomainId, cr)
+		newRecord := &api.Record{}
+		newRecord.Type = record.Type
+		newRecord.Name = record.Fqdn
+		newRecord.Value = rec
+		newRecord.GtdLocation = "DEFAULT"
+		newRecord.Ttl = record.TTL
 
-	    if err2 != nil {
-		    logrus.Fatalf("Result: '%s' Error: %s", result, err2)
-      }
+		result := client.AddRecord(r.dnsmeDomainID, newRecord)
 
-	    logrus.Printf("Result: '%s'", result)
-    }
+		if result != nil {
+			logrus.Fatalf("Error: %s", result)
+		}
+
+		logrus.Printf("Record Added")
+	}
 
 	return nil
 }
 
+// RemoveRecord from provider
 func (r *DNSMEProvider) RemoveRecord(record utils.DnsRecord) error {
 	logrus.Debugf("Removing Record '%s %s'", record.Fqdn, record.Type)
 
-  client, err := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
-    if err != nil {
-      logrus.Fatalf("err: %v", err)
-    }
+	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
+	client.Url = r.dnsmeServer
 
-    client.URL = r.dnsmeServer
+	recordID, err := r.GetDomainRecordByName(record.Fqdn, record.Type)
+	if err != nil {
+		logrus.Fatalf("Error: %s", err)
+	}
 
-  	err2 := client.DeleteRecord(r.dnsmeDomainId, record.Fqdn)
-  	if err2 != nil {
-  		logrus.Fatalf("DeleteRecord result: %v", err2)
-  	}
-  	logrus.Print("Record Removed")
+	result := client.DelRecord(r.dnsmeDomainID, recordID)
+	if result != nil {
+		logrus.Fatalf("DeleteRecord result: %v", result)
+	}
+	logrus.Print("Record Removed")
 
 	return nil
 }
 
+// UpdateRecord provider
 func (r *DNSMEProvider) UpdateRecord(record utils.DnsRecord) error {
-	err := r.RemoveRecord(record)
-	if err != nil {
-		return err
+	logrus.Debugf("Updating Record '%s %s'", record.Fqdn, record.Type)
+
+	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
+
+	client.Url = r.dnsmeServer
+
+	for _, rec := range record.Records {
+		logrus.Debugf("Updating RR: '%s %d %s %s'", record.Fqdn, record.TTL, record.Type, rec)
+
+		newRecord := &api.Record{}
+		newRecord.Type = record.Type
+		newRecord.Name = record.Fqdn
+		newRecord.Value = rec
+		newRecord.GtdLocation = "DEFAULT"
+		newRecord.Ttl = record.TTL
+
+		result := client.UpdRecord(r.dnsmeDomainID, newRecord)
+
+		if result != nil {
+			logrus.Fatalf("Error: %s", result)
+		}
+
+		logrus.Printf("TRecord Updated")
 	}
 
-	return r.AddRecord(record)
+	return nil
 }
 
+// GetRecords from provider
 func (r *DNSMEProvider) GetRecords() ([]utils.DnsRecord, error) {
+	logrus.Debugf("Getting Records")
 	records := make([]utils.DnsRecord, 0)
-	list, err := r.list()
-	if err != nil {
-		return records, err
+
+	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
+	client.Url = r.dnsmeServer
+
+	result, err2 := client.GetDomainRecords(r.dnsmeDomainID)
+	if err2 != nil {
+		return records, fmt.Errorf("DNSMadeEasy API Failed: %v", err2)
 	}
 
-OuterLoop:
-	for _, rr := range list {
-		if rr.Header().Class != dns.ClassINET {
-			continue
-		}
+	for _, rec := range result {
 
-		rrFqdn := rr.Header().Name
-		rrTTL := int(rr.Header().Ttl)
-		var rrType string
-		var rrValues []string
-		switch rr.Header().Rrtype {
-		case dns.TypeCNAME:
-			rrValues = []string{rr.(*dns.CNAME).Target}
-			rrType = "CNAME"
-		case dns.TypeA:
-			rrValues = []string{rr.(*dns.A).A.String()}
-			rrType = "A"
-		case dns.TypeAAAA:
-			rrValues = []string{rr.(*dns.AAAA).AAAA.String()}
-			rrType = "AAAA"
-		case dns.TypeTXT:
-			rrValues = rr.(*dns.TXT).Txt
-			rrType = "TXT"
-		default:
-			continue // Unhandled record type
-		}
+		recFQDN := utils.Fqdn(rec.Name)
+		recTTL := rec.Ttl
+		recType := rec.Type
+		var recValueArray = []string{}
+		recValueArray = append(recValueArray, rec.Value)
 
-		for idx, existingRecord := range records {
-			if existingRecord.Fqdn == rrFqdn && existingRecord.Type == rrType {
-				records[idx].Records = append(records[idx].Records, rrValues...)
-				continue OuterLoop
-			}
-		}
-
-		record := utils.DnsRecord{
-			Fqdn:    rrFqdn,
-			Type:    rrType,
-			TTL:     rrTTL,
-			Records: rrValues,
-		}
-
+		record := utils.DnsRecord{Fqdn: recFQDN, Records: recValueArray, Type: recType, TTL: recTTL}
 		records = append(records, record)
 	}
-
 	return records, nil
+
 }
 
-func (r *DNSMEProvider) sendMessage(msg *dns.Msg) error {
-	c := new(dns.Client)
-	c.TsigSecret = map[string]string{r.tsigKeyName: r.tsigSecret}
-	c.SingleInflight = true
-	msg.SetTsig(r.tsigKeyName, dns.HmacMD5, 300, time.Now().Unix())
-	resp, _, err := c.Exchange(msg, r.nameserver)
+// GetDomainRecordByName from providers
+func (r *DNSMEProvider) GetDomainRecordByName(recordName string, recordType string) (uint32, error) {
+	logrus.Debugf("Getting Record ID by Name and Type")
+
+	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
+	client.Url = r.dnsmeServer
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s%d/records?recordName=%s&type=%s", client.Url, r.dnsmeDomainID, recordName, recordType), nil)
+	if err != nil {
+		logrus.Fatalf("Error: %s", err)
+	}
+
+	record := &api.Record{}
+	err = r.request(req, record)
+
+	return record.Id, err
+}
+
+func (r *DNSMEProvider) request(req *http.Request, object interface{}) error {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	client := &http.Client{Transport: transport}
+
+	req.Header.Add("x-dnsme-apikey", r.dnsmeKey)
+	requestDate := time.Now().UTC().Format(time.RFC1123)
+	req.Header.Add("x-dnsme-requestdate", requestDate)
+
+	h := hmac.New(sha1.New, []byte(r.dnsmeSecret))
+	h.Write([]byte(requestDate))
+	req.Header.Add("x-dnsme-hmac", fmt.Sprintf("%x", h.Sum(nil)))
+
+	req.Header.Add("Accept", "application/json")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 
-	if resp != nil && resp.Rcode != dns.RcodeSuccess {
-		return fmt.Errorf("Bad return code: %s", dns.RcodeToString[resp.Rcode])
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		apierr := &APIError{}
+		json.Unmarshal(buf.Bytes(), apierr)
+		apierr.Code = resp.StatusCode
+
+		return apierr
+	}
+
+	if buf.Len() > 0 {
+		return json.Unmarshal(buf.Bytes(), object)
 	}
 
 	return nil
 }
 
-func (r *DNSMEProvider) list() ([]dns.RR, error) {
-	logrus.Debugf("Fetching records for '%s'", r.zoneName)
-	t := new(dns.Transfer)
-	t.TsigSecret = map[string]string{r.tsigKeyName: r.tsigSecret}
+// APIError Represents an API Error. Code corresponds to the HTTP Status Code returned by the API.
+// Messages is a list of error messages returned by the DNS Made Easy API
+type APIError struct {
+	Code     int      `json:"-"`
+	Messages []string `json:"error"`
+}
 
-	m := new(dns.Msg)
-	m.SetAxfr(r.zoneName)
-	m.SetTsig(r.tsigKeyName, dns.HmacMD5, 300, time.Now().Unix())
-
-	env, err := t.In(m, r.nameserver)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch records via AXFR: %v", err)
-	}
-
-	records := make([]dns.RR, 0)
-	for e := range env {
-		if e.Error != nil {
-			logrus.Errorf("AXFR envelope error: %v", e.Error)
-			continue
-		}
-		records = append(records, e.RR...)
-	}
-
-	return records, nil
+func (a *APIError) Error() string {
+	return fmt.Sprintf("API Error. Code:%d Message:%s", a.Code, strings.Join(a.Messages, " "))
 }
