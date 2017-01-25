@@ -2,3 +2,9 @@ external-dns
 build
 dist
 bin
+
+deploy.sh
+
+packaging/external-dns.tar.gz
+
+deploy.sh
