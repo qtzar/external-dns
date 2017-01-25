@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	api "github.com/huguesalary/dnsmadeeasy"
+	"github.com/juju/ratelimit"
 	"github.com/rancher/external-dns/providers"
 	"github.com/rancher/external-dns/utils"
 )
@@ -26,6 +27,7 @@ type DNSMEProvider struct {
 	dnsmeServer   string
 	dnsmeKey      string
 	dnsmeSecret   string
+	limiter       *ratelimit.Bucket
 }
 
 func init() {
@@ -61,23 +63,24 @@ func (r *DNSMEProvider) Init(rootDomainName string) error {
 		server = "https://api.dnsmadeeasy.com/V2.0/dns/managed/"
 	}
 
-	//TODO Rate Limiting
-	//  This limit is 150 requests per 5 minute scrolling window
+	//  DNSMadeEasy limit is 150 requests per 5 minute scrolling window
+	doqps := (float64)(150.0 / 300.0)
+	r.limiter = ratelimit.NewBucketWithRate(doqps, 100)
 
-	// Convert the domainID in to a uint
 	u64domainID, err := strconv.ParseUint(domainID, 10, 32)
 	if err != nil {
 		fmt.Println(err)
 	}
 
 	r.dnsmeZone = rootDomainName
-	r.dnsmeDomainID = uint32(u64domainID)
 	r.dnsmeServer = server
 	r.dnsmeKey = keyName
 	r.dnsmeSecret = secret
 
-	logrus.Infof("Configured %s with domain id '%s' and nameserver '%s'",
-		r.GetName(), r.dnsmeDomainID, r.dnsmeServer)
+	r.dnsmeDomainID = uint32(u64domainID)
+
+	logrus.Infof("DNS Made Easy Configured %s with domain id '%s' and nameserver '%s'",
+		r.GetName(), fmt.Sprint(r.dnsmeDomainID), r.dnsmeServer)
 
 	return nil
 }
@@ -95,29 +98,27 @@ func (r *DNSMEProvider) HealthCheck() error {
 
 // AddRecord to provider
 func (r *DNSMEProvider) AddRecord(record utils.DnsRecord) error {
-	logrus.Debugf("Adding Record '%s %s'", record.Fqdn, record.Type)
+	logrus.Debugf("DNSME Adding Records")
 
 	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
-
 	client.Url = r.dnsmeServer
 
 	for _, rec := range record.Records {
-		logrus.Debugf("Adding RR: '%s %d %s %s'", record.Fqdn, record.TTL, record.Type, rec)
+		name := r.parseName(record)
+		logrus.Debugf("DNSME Adding Record: '%s %d %s %s'", name, record.TTL, record.Type, rec)
 
 		newRecord := &api.Record{}
 		newRecord.Type = record.Type
-		newRecord.Name = record.Fqdn
+		newRecord.Name = name
 		newRecord.Value = rec
 		newRecord.GtdLocation = "DEFAULT"
 		newRecord.Ttl = record.TTL
 
+		r.limiter.Wait(1)
 		result := client.AddRecord(r.dnsmeDomainID, newRecord)
-
 		if result != nil {
-			logrus.Fatalf("Error: %s", result)
+			logrus.Errorf("Error: %s", result)
 		}
-
-		logrus.Printf("Record Added")
 	}
 
 	return nil
@@ -125,99 +126,113 @@ func (r *DNSMEProvider) AddRecord(record utils.DnsRecord) error {
 
 // RemoveRecord from provider
 func (r *DNSMEProvider) RemoveRecord(record utils.DnsRecord) error {
-	logrus.Debugf("Removing Record '%s %s'", record.Fqdn, record.Type)
+	logrus.Debugf("DNSME Removing Record '%s %s'", record.Fqdn, record.Type)
+
+	name := r.parseName(record)
+	r.limiter.Wait(1)
+	records, err := r.getDomainRecordsByName(name, record.Type)
+	if err != nil {
+		return err
+	}
 
 	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
 	client.Url = r.dnsmeServer
+	for _, rec := range records {
+		logrus.Debugf("DNSME Removing Record: '%s %d %s %d'", rec.Name, record.TTL, record.Type, rec.Id)
 
-	recordID, err := r.GetDomainRecordByName(record.Fqdn, record.Type)
-	if err != nil {
-		logrus.Fatalf("Error: %s", err)
+		r.limiter.Wait(1)
+		result := client.DelRecord(r.dnsmeDomainID, rec.Id)
+		if result != nil {
+			logrus.Errorf("DNSME Remove Record Error: %+v", result)
+		}
 	}
-
-	result := client.DelRecord(r.dnsmeDomainID, recordID)
-	if result != nil {
-		logrus.Fatalf("DeleteRecord result: %v", result)
-	}
-	logrus.Print("Record Removed")
-
 	return nil
 }
 
 // UpdateRecord provider
 func (r *DNSMEProvider) UpdateRecord(record utils.DnsRecord) error {
-	logrus.Debugf("Updating Record '%s %s'", record.Fqdn, record.Type)
-
-	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
-
-	client.Url = r.dnsmeServer
-
-	for _, rec := range record.Records {
-		logrus.Debugf("Updating RR: '%s %d %s %s'", record.Fqdn, record.TTL, record.Type, rec)
-
-		newRecord := &api.Record{}
-		newRecord.Type = record.Type
-		newRecord.Name = record.Fqdn
-		newRecord.Value = rec
-		newRecord.GtdLocation = "DEFAULT"
-		newRecord.Ttl = record.TTL
-
-		result := client.UpdRecord(r.dnsmeDomainID, newRecord)
-
-		if result != nil {
-			logrus.Fatalf("Error: %s", result)
-		}
-
-		logrus.Printf("TRecord Updated")
+	logrus.Debugf("DNSME Updating Record '%s %s'", record.Fqdn, record.Type)
+	err := r.RemoveRecord(record)
+	if err != nil {
+		return err
 	}
-
-	return nil
+	return r.AddRecord(record)
 }
 
 // GetRecords from provider
 func (r *DNSMEProvider) GetRecords() ([]utils.DnsRecord, error) {
-	logrus.Debugf("Getting Records")
+	logrus.Debugf("DNSME Getting Records")
 	records := make([]utils.DnsRecord, 0)
 
 	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
 	client.Url = r.dnsmeServer
 
+	r.limiter.Wait(1)
 	result, err2 := client.GetDomainRecords(r.dnsmeDomainID)
 	if err2 != nil {
 		return records, fmt.Errorf("DNSMadeEasy API Failed: %v", err2)
 	}
 
+	logrus.Debugf("DNSME Retrieved %d Records.", len(result))
+
 	for _, rec := range result {
+		logrus.Debugf("DNSME Processing Retrieved Record : %s", rec.Name)
 
-		recFQDN := utils.Fqdn(rec.Name)
-		recTTL := rec.Ttl
-		recType := rec.Type
-		var recValueArray = []string{}
-		recValueArray = append(recValueArray, rec.Value)
+		found := false
+		recFQDN := fmt.Sprintf("%s.%s", rec.Name, r.dnsmeZone)
 
-		record := utils.DnsRecord{Fqdn: recFQDN, Records: recValueArray, Type: recType, TTL: recTTL}
-		records = append(records, record)
+		if rec.Type == "TXT" {
+			rec.Value = strings.Replace(rec.Value, "\"", "", -1)
+		}
+
+		for i, re := range records {
+			if re.Fqdn == recFQDN {
+				found = true
+				cont := append(re.Records, rec.Value)
+				records[i] = utils.DnsRecord{
+					Fqdn:    recFQDN,
+					Records: cont,
+					Type:    rec.Type,
+					TTL:     rec.Ttl,
+				}
+			}
+		}
+		if !found {
+			r := utils.DnsRecord{
+				Fqdn:    recFQDN,
+				Records: []string{rec.Value},
+				Type:    rec.Type,
+				TTL:     rec.Ttl,
+			}
+			records = append(records, r)
+		}
 	}
 	return records, nil
 
 }
 
 // GetDomainRecordByName from providers
-func (r *DNSMEProvider) GetDomainRecordByName(recordName string, recordType string) (uint32, error) {
-	logrus.Debugf("Getting Record ID by Name and Type")
+func (r *DNSMEProvider) getDomainRecordsByName(recordName string, recordType string) ([]*api.Record, error) {
+	logrus.Debugf("DNSME Getting Domain Records by Name and Type")
 
 	client := api.NewClient(r.dnsmeKey, r.dnsmeSecret)
 	client.Url = r.dnsmeServer
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s%d/records?recordName=%s&type=%s", client.Url, r.dnsmeDomainID, recordName, recordType), nil)
 	if err != nil {
-		logrus.Fatalf("Error: %s", err)
+		logrus.Errorf("Error http : %s", err)
 	}
 
-	record := &api.Record{}
-	err = r.request(req, record)
+	domainRecords := &api.DomainRecords{}
+	err2 := r.request(req, domainRecords)
+	if err2 != nil {
+		logrus.Errorf("Error request : %s", err2)
+	}
 
-	return record.Id, err
+	logrus.Debugf("DNSME Record %+v", domainRecords.Records)
+
+	return domainRecords.Records, err
+
 }
 
 func (r *DNSMEProvider) request(req *http.Request, object interface{}) error {
@@ -239,6 +254,7 @@ func (r *DNSMEProvider) request(req *http.Request, object interface{}) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		logrus.Errorf("Error Doing Request : %s", err)
 		return err
 	}
 
@@ -249,7 +265,7 @@ func (r *DNSMEProvider) request(req *http.Request, object interface{}) error {
 		apierr := &APIError{}
 		json.Unmarshal(buf.Bytes(), apierr)
 		apierr.Code = resp.StatusCode
-
+		logrus.Errorf("API Error : %+v", apierr)
 		return apierr
 	}
 
@@ -269,4 +285,13 @@ type APIError struct {
 
 func (a *APIError) Error() string {
 	return fmt.Sprintf("API Error. Code:%d Message:%s", a.Code, strings.Join(a.Messages, " "))
+}
+
+// parseName will remove the domain name and trailing . as DNSMadeEasy Does not want this
+func (r *DNSMEProvider) parseName(record utils.DnsRecord) string {
+
+	noDomain := strings.Replace(record.Fqdn, "."+r.dnsmeZone, "", -1)
+	logrus.Infof("DNSME : Parsed Name : %s", noDomain)
+
+	return noDomain
 }
